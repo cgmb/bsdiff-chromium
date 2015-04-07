@@ -1,7 +1,4 @@
-CFLAGS		+=	-O3
-.ifdef BZIP2
-CFLAGS		+=	-DBZIP2=\"${BZIP2}\"
-.endif
+CFLAGS		+=	-O3 -lbz2
 
 PREFIX		?=	/usr/local
 INSTALL_PROGRAM	?=	${INSTALL} -c -s -m 555

@@ -1,73 +1,42 @@
-/*
-  .c -- Binary patcher
+/*-
+ * Copyright 2003-2005 Colin Percival
+ * All rights reserved
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted providing that the following conditions 
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+ * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
 
-  Copyright 2003,2004 Colin Percival
-
-  For the terms under which this work may be distributed, please see
-  the adjoining file "LICENSE".
-*/
-
-#ifndef BZIP2
-#define BZIP2 "/usr/bin/bzip2"
+#if 0
+__FBSDID("$FreeBSD: src/usr.bin/bsdiff/bspatch/bspatch.c,v 1.1 2005/08/06 01:59:06 cperciva Exp $");
 #endif
 
+#include <bzlib.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <err.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/wait.h>
 
-ssize_t loopread(int d,void *buf,size_t nbytes)
-{
-	ssize_t ptr,lenread;
-
-	for(ptr=0;ptr<nbytes;ptr+=lenread) {
-		lenread=read(d,buf+ptr,nbytes-ptr);
-		if(lenread==0) return ptr;
-		if(lenread==-1) return -1;
-	};
-	return ptr;
-}
-
-int bz2read(int fd,off_t offset,off_t len,char * fname,pid_t * pids)
-{
-	int p0[2],p1[2];
-	u_char * data;
-
-	if((pipe(p0)==-1) || (pipe(p1)==-1)) err(1,NULL);
-
-	if((pids[0]=fork())==-1) err(1,NULL);
-	if(pids[0]==0) {
-		if(close(0) || close(1) || close(p0[0]) ||
-			close(p1[0]) || close(p1[1])) err(1,NULL);
-		if((data=malloc(len+1))==NULL) err(1,NULL);
-		if((pread(fd,data,len,offset)!=len) || close(fd))
-			err(1,"%s",fname);
-		if((write(p0[1],data,len)!=len) || close(p0[1]))
-			err(1,NULL);
-		free(data);
-		_exit(0);
-	};
-
-	if((pids[1]=fork())==-1) err(1,NULL);
-	if(pids[1]==0) {
-		if(close(0) || close(1) || close(p0[1]) ||
-			close(p1[0])) err(1,NULL);
-		if((dup2(p0[0],0)==-1) || close(p0[0])) err(1,NULL);
-		if((dup2(p1[1],1)==-1) || close(p1[1])) err(1,NULL);
-		if(close(fd)==-1) err(1,"%s",fname);
-
-		execl(BZIP2,BZIP2,"-dc",NULL);
-		err(1,"%s",BZIP2);
-	};
-
-	if(close(p0[0]) || close(p0[1]) || close(p1[1])) err(1,NULL);
-
-	return p1[0];
-}
-
-off_t offtin(u_char *buf)
+static off_t offtin(u_char *buf)
 {
 	off_t y;
 
@@ -87,12 +56,13 @@ off_t offtin(u_char *buf)
 
 int main(int argc,char * argv[])
 {
-	int fd,ctrlpipe,diffpipe,extrapipe;
-	pid_t pids[6];
-	ssize_t patchsize,oldsize,newsize;
+	FILE * f, * cpf, * dpf, * epf;
+	BZFILE * cpfbz2, * dpfbz2, * epfbz2;
+	int cbz2err, dbz2err, ebz2err;
+	int fd;
+	ssize_t oldsize,newsize;
 	ssize_t bzctrllen,bzdatalen;
 	u_char header[32],buf[8];
-	int version=0;
 	u_char *old, *new;
 	off_t oldpos,newpos;
 	off_t ctrl[3];
@@ -101,27 +71,12 @@ int main(int argc,char * argv[])
 
 	if(argc!=4) errx(1,"usage: %s oldfile newfile patchfile\n",argv[0]);
 
-	if(((fd=open(argv[3],O_RDONLY,0))<0) ||
-		((patchsize=lseek(fd,0,SEEK_END))==-1) ||
-		(lseek(fd,0,SEEK_SET)!=0)) err(1,"%s",argv[3]);
-	if(patchsize<32) errx(1,"Corrupt patch\n");
+	/* Open patch file */
+	if ((f = fopen(argv[3], "r")) == NULL)
+		err(1, "fopen(%s)", argv[3]);
 
 	/*
-	  Ok, this is going to be messy.  There are two different patch
-	formats which we need to support.
-
-	  The old format (pre-4.0) is:
-		0	8	"QSUFDIFF" or "BSDIFF30"
-		8	8	X
-		16	8	Y
-		24	8	sizeof(newfile)
-		32	X	bzip2(control block)
-		32+X	Y	bzip2(data block)
-	with control block a set of pairs (x,y) meaning "seek forward
-	in oldfile by y bytes, and add the next x bytes to x bytes from
-	the data block".
-
-	  The new format (4.0) is:
+	File format:
 		0	8	"BSDIFF40"
 		8	8	X
 		16	8	Y
@@ -134,28 +89,49 @@ int main(int argc,char * argv[])
 	extra block; seek forwards in oldfile by z bytes".
 	*/
 
-	if(read(fd,header,32)!=32) err(1,"%s",argv[3]);
-	if(memcmp(header,"QSUFDIFF",8)==0) version=1;
-	if(memcmp(header,"BSDIFF30",8)==0) version=1;
-	if(memcmp(header,"BSDIFF40",8)==0) version=2;
+	/* Read header */
+	if (fread(header, 1, 32, f) < 32) {
+		if (feof(f))
+			errx(1, "Corrupt patch\n");
+		err(1, "fread(%s)", argv[3]);
+	}
 
-	if(!version) errx(1,"Corrupt patch\n");
+	/* Check for appropriate magic */
+	if (memcmp(header, "BSDIFF40", 8) != 0)
+		errx(1, "Corrupt patch\n");
 
+	/* Read lengths from header */
 	bzctrllen=offtin(header+8);
 	bzdatalen=offtin(header+16);
 	newsize=offtin(header+24);
-	if((bzctrllen<0) || (bzdatalen<0) || (newsize<0) ||
-		((version==1) && (32+bzctrllen+bzdatalen!=patchsize)))
+	if((bzctrllen<0) || (bzdatalen<0) || (newsize<0))
 		errx(1,"Corrupt patch\n");
 
-	ctrlpipe=bz2read(fd,32,bzctrllen,argv[3],pids);
-	diffpipe=bz2read(fd,32+bzctrllen,bzdatalen,argv[3],pids+2);
-	if(version==2) {
-		extrapipe=bz2read(fd,32+bzctrllen+bzdatalen,
-			patchsize-(32+bzctrllen+bzdatalen),argv[3],pids+4);
-	};
+	/* Close patch file and re-open it via libbzip2 at the right places */
+	if (fclose(f))
+		err(1, "fclose(%s)", argv[3]);
+	if ((cpf = fopen(argv[3], "r")) == NULL)
+		err(1, "fopen(%s)", argv[3]);
+	if (fseeko(cpf, 32, SEEK_SET))
+		err(1, "fseeko(%s, %lld)", argv[3],
+		    (long long)32);
+	if ((cpfbz2 = BZ2_bzReadOpen(&cbz2err, cpf, 0, 0, NULL, 0)) == NULL)
+		errx(1, "BZ2_bzReadOpen, bz2err = %d", cbz2err);
+	if ((dpf = fopen(argv[3], "r")) == NULL)
+		err(1, "fopen(%s)", argv[3]);
+	if (fseeko(dpf, 32 + bzctrllen, SEEK_SET))
+		err(1, "fseeko(%s, %lld)", argv[3],
+		    (long long)(32 + bzctrllen));
+	if ((dpfbz2 = BZ2_bzReadOpen(&dbz2err, dpf, 0, 0, NULL, 0)) == NULL)
+		errx(1, "BZ2_bzReadOpen, bz2err = %d", dbz2err);
+	if ((epf = fopen(argv[3], "r")) == NULL)
+		err(1, "fopen(%s)", argv[3]);
+	if (fseeko(epf, 32 + bzctrllen + bzdatalen, SEEK_SET))
+		err(1, "fseeko(%s, %lld)", argv[3],
+		    (long long)(32 + bzctrllen + bzdatalen));
+	if ((epfbz2 = BZ2_bzReadOpen(&ebz2err, epf, 0, 0, NULL, 0)) == NULL)
+		errx(1, "BZ2_bzReadOpen, bz2err = %d", ebz2err);
 
-	if(close(fd)==-1) err(1,"%s",argv[3]);
 	if(((fd=open(argv[1],O_RDONLY,0))<0) ||
 		((oldsize=lseek(fd,0,SEEK_END))==-1) ||
 		((old=malloc(oldsize+1))==NULL) ||
@@ -166,45 +142,57 @@ int main(int argc,char * argv[])
 
 	oldpos=0;newpos=0;
 	while(newpos<newsize) {
-		for(i=0;i<=version;i++) {
-			if((lenread=loopread(ctrlpipe,buf,8))<0) err(1,NULL);
-			if(lenread<8) errx(1,"Corrupt patch\n");
+		/* Read control data */
+		for(i=0;i<=2;i++) {
+			lenread = BZ2_bzRead(&cbz2err, cpfbz2, buf, 8);
+			if ((lenread < 8) || ((cbz2err != BZ_OK) &&
+			    (cbz2err != BZ_STREAM_END)))
+				errx(1, "Corrupt patch\n");
 			ctrl[i]=offtin(buf);
 		};
 
-		if(version==1) oldpos+=ctrl[1];
+		/* Sanity-check */
+		if(newpos+ctrl[0]>newsize)
+			errx(1,"Corrupt patch\n");
 
-		if(newpos+ctrl[0]>newsize) errx(1,"Corrupt patch\n");
-		if((lenread=loopread(diffpipe,new+newpos,ctrl[0]))<0)
-			err(1,NULL);
-		if(lenread!=ctrl[0]) errx(1,"Corrupt patch\n");
+		/* Read diff string */
+		lenread = BZ2_bzRead(&dbz2err, dpfbz2, new + newpos, ctrl[0]);
+		if ((lenread < ctrl[0]) ||
+		    ((dbz2err != BZ_OK) && (dbz2err != BZ_STREAM_END)))
+			errx(1, "Corrupt patch\n");
+
+		/* Add old data to diff string */
 		for(i=0;i<ctrl[0];i++)
 			if((oldpos+i>=0) && (oldpos+i<oldsize))
 				new[newpos+i]+=old[oldpos+i];
+
+		/* Adjust pointers */
 		newpos+=ctrl[0];
 		oldpos+=ctrl[0];
 
-		if(version==2) {
-			if(newpos+ctrl[1]>newsize) errx(1,"Corrupt patch\n");
-			if((lenread=loopread(extrapipe,new+newpos,ctrl[1]))<0)
-				err(1,NULL);
-			if(lenread!=ctrl[1]) errx(1,"Corrupt patch\n");
+		/* Sanity-check */
+		if(newpos+ctrl[1]>newsize)
+			errx(1,"Corrupt patch\n");
 
-			newpos+=ctrl[1];
-			oldpos+=ctrl[2];
-		};
+		/* Read extra string */
+		lenread = BZ2_bzRead(&ebz2err, epfbz2, new + newpos, ctrl[1]);
+		if ((lenread < ctrl[1]) ||
+		    ((ebz2err != BZ_OK) && (ebz2err != BZ_STREAM_END)))
+			errx(1, "Corrupt patch\n");
+
+		/* Adjust pointers */
+		newpos+=ctrl[1];
+		oldpos+=ctrl[2];
 	};
 
-	if(loopread(ctrlpipe,buf,1)!=0) errx(1,"Corrupt patch\n");
-	if(loopread(diffpipe,buf,1)!=0) errx(1,"Corrupt patch\n");
-	if(version==2)
-		if(loopread(extrapipe,buf,1)!=0) errx(1,"Corrupt patch\n");
+	/* Clean up the bzip2 reads */
+	BZ2_bzReadClose(&cbz2err, cpfbz2);
+	BZ2_bzReadClose(&dbz2err, dpfbz2);
+	BZ2_bzReadClose(&ebz2err, epfbz2);
+	if (fclose(cpf) || fclose(dpf) || fclose(epf))
+		err(1, "fclose(%s)", argv[3]);
 
-	if(close(ctrlpipe) || close(diffpipe) || 
-		((version==2) && close(extrapipe)))
-		err(1,NULL);
-	for(i=0;i<(version+1)*2;i++) waitpid(pids[i],NULL,0);
-
+	/* Write the new file */
 	if(((fd=open(argv[2],O_CREAT|O_TRUNC|O_WRONLY,0666))<0) ||
 		(write(fd,new,newsize)!=newsize) || (close(fd)==-1))
 		err(1,"%s",argv[2]);
