@@ -1,7 +1,7 @@
 /*
   .c -- Binary patcher
 
-  Copyright 2003 Colin Percival
+  Copyright 2003,2004 Colin Percival
 
   For the terms under which this work may be distributed, please see
   the adjoining file "LICENSE".
@@ -42,8 +42,7 @@ int bz2read(int fd,off_t offset,off_t len,char * fname,pid_t * pids)
 		if(close(0) || close(1) || close(p0[0]) ||
 			close(p1[0]) || close(p1[1])) err(1,NULL);
 		if((data=malloc(len+1))==NULL) err(1,NULL);
-		if(((lseek(fd,offset,SEEK_SET)!=offset) ||
-			read(fd,data,len)!=len) || close(fd))
+		if((pread(fd,data,len,offset)!=len) || close(fd))
 			err(1,"%s",fname);
 		if((write(p0[1],data,len)!=len) || close(p0[1]))
 			err(1,NULL);
